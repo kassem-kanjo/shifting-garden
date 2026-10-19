@@ -26,3 +26,4 @@ date · phase · what · why · where
 - 10-19 · 5 · README, CHANGELOG, DECISIONS; demo.gif + hero · · docs/
 - 10-19 · 3 · seal removed (user) · · web/index.html
 - 10-19 · 6 · repo made public for the launch post; X draft saved with GIF (not posted); README leads with release download · · notes/x-post.md
+- 10-19 · 6 · X media redone as 1080² 30 fps MP4 (user: GIF not good enough, wants high resolution); draft updated · · export/x post.mp4
