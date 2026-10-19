@@ -25,3 +25,4 @@ date · phase · what · why · where
 - 10-19 · 4 · saver rebuilt and installed to ~/Library/Screen Savers (not yet selected or watched in legacyScreenSaver) · · mac/
 - 10-19 · 5 · README, CHANGELOG, DECISIONS; demo.gif + hero · · docs/
 - 10-19 · 3 · seal removed (user) · · web/index.html
+- 10-19 · 6 · repo made public for the launch post; X draft saved with GIF (not posted); README leads with release download · · notes/x-post.md
