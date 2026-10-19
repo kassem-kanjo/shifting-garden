@@ -13,7 +13,8 @@
 
 | | |
 |---|---|
-| **Mac screensaver** | `mac/install.sh`, then System Settings → Screen Saver → *Shifting Garden* |
+| **Mac screensaver** | [Download the latest release](https://github.com/kassem-kanjo/shifting-garden/releases/latest), unzip, double-click *Shifting Garden.saver* |
+| **Build it yourself** | `mac/install.sh`, then System Settings → Screen Saver → *Shifting Garden* |
 | **In a browser** | open `web/index.html` (press `n` for the next scene, `d` for the readout) |
 
 ## What you're looking at
