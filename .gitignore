@@ -5,3 +5,4 @@ inspo/
 export/*.mov
 export/*.mp4
 __pycache__/
+export/*master.mp4
