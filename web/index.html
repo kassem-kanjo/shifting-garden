@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shifting Garden</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #F3E9D2; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  body.saver, body.saver * { cursor: none !important; }
+  #hud { position: fixed; left: 12px; bottom: 10px; font: 12px ui-monospace, Menlo, monospace;
+         color: #1A1A1A; background: #F3E9D2cc; padding: 4px 8px; display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<script src="scenes.js"></script>
+<script>
+"use strict";
+// Shifting Garden: woodblock scenes cut into a sliding puzzle with a few empty cells.
+// Each scene breathes: it scatters by random slides, then the recorded slides replay in
+// reverse until the picture is whole, then the next scene prints over it.
+
+const Q = new URLSearchParams(location.search);
+const SAVER = Q.get("saver") === "1";
+const SPEED = parseFloat(Q.get("speed") || "1");      // time multiplier, for reviewing
+const DEBUG = Q.get("debug") === "1";
+if (SAVER) document.body.classList.add("saver");
+
+// --- tuning -------------------------------------------------------------------------
+const T = {
+  rows: 8,                 // cells top to bottom; columns follow from the screen shape
+  holeShare: 0.05,         // share of cells left empty
+  slide: 1.2,              // seconds a block takes to glide into a gap
+  stagger: 0.14,           // seconds between the blocks of one wave starting to move
+  beat: 2.6,               // seconds between waves while scattering (every gap moves once per wave)
+  gatherBeat: 2.1,         // seconds between waves while coming back together
+  scatterWaves: 40,        // waves before the picture starts coming back
+  holdWhole: 7,            // seconds the whole picture rests before the next scene
+  glitchShare: 0.36,       // share of tiles carrying a glitch at any time
+  reroll: 0.45,            // chance a tile changes its glitch when it lands
+  flickerEvery: 0.35,      // seconds between short flickers somewhere on the grid
+  line: 0.011,             // keyline width of the countdown label, as a share of cell size
+};
+
+const PAPER = "#F3E9D2", INK = "#1A1A1A", RECESS = "#DCCFB2";
+const PALETTES = [         // dark → light, for the dither and mosaic glitches
+  ["#1A1A1A", "#2E7D62", "#6FE3C4", "#F3E9D2"],
+  ["#1A1A1A", "#E8341C", "#EE8FB4", "#F3E9D2"],
+  ["#1A1A1A", "#3E62C4", "#F6C21B", "#F3E9D2"],
+  ["#2B2440", "#7A5CC8", "#EE8FB4", "#F7EEDD"],
+  ["#1A1A1A", "#E8341C", "#F6C21B", "#F3E9D2"],
+];
+const GLYPHS = "@#$%&*+=-:;~^<>/\\|!?{}[]()0O8XxZzBbdpqwmkhaoecljt";
+
+// --- random -------------------------------------------------------------------------
+let seed = parseInt(Q.get("seed") || String(Date.now() % 1e9), 10);
+function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+const pick = a => a[Math.floor(rnd() * a.length)];
+const range = (a, b) => a + rnd() * (b - a);
+
+// --- canvas -------------------------------------------------------------------------
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+const hud = document.getElementById("hud");
+if (DEBUG) hud.style.display = "block";
+let W = 0, H = 0, DPR = 1, cell = 0, cols = 0, rows = 0, ox = 0, oy = 0;
+
+function mk(w, h) { const c = document.createElement("canvas"); c.width = w; c.height = h; return c; }
+function hex(h) { return [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)); }
+const PAL_RGB = PALETTES.map(p => p.map(hex));
+
+// --- scenes -------------------------------------------------------------------------
+const SCENES = (window.SHIFTING_GARDEN_SCENES || []);
+const images = [];
+let loaded = 0;
+
+function loadScenes(done) {
+  if (!SCENES.length) { done(); return; }
+  SCENES.forEach((s, i) => {
+    const im = new Image();
+    im.onload = () => { images[i] = im; if (++loaded === SCENES.length) done(); };
+    im.onerror = () => { if (++loaded === SCENES.length) done(); };
+    im.src = s.src;
+  });
+}
+
+// Cut one scene into cell-sized tiles (cover-fit, centred).
+function cutScene(im) {
+  const gw = cols * cell, gh = rows * cell;
+  const full = mk(gw, gh), f = full.getContext("2d");
+  f.fillStyle = PAPER; f.fillRect(0, 0, gw, gh);
+  if (im) {
+    const s = Math.max(gw / im.width, gh / im.height);
+    const dw = im.width * s, dh = im.height * s;
+    f.imageSmoothingQuality = "high";
+    f.drawImage(im, (gw - dw) / 2, (gh - dh) / 2, dw, dh);
+  }
+  // how much of each tile is picture rather than bare paper (0..1), from a tiny sample
+  const busy = [], sw = cols * 8, sh = rows * 8, sm = mk(sw, sh), s = sm.getContext("2d");
+  s.drawImage(full, 0, 0, sw, sh);
+  const px = s.getImageData(0, 0, sw, sh).data;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    let ink = 0;
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+      const i = ((r * 8 + y) * sw + c * 8 + x) * 4;
+      if (lum(px[i], px[i + 1], px[i + 2]) < 0.78) ink++;
+    }
+    busy.push(ink / 64);
+  }
+  return { full, busy };
+}
+
+// One tile of a scene as its own canvas (only made when an effect needs pixels).
+function tileOf(sc, id) {
+  const t = mk(cell, cell);
+  t.getContext("2d").drawImage(sc.full, (id % cols) * cell, Math.floor(id / cols) * cell, cell, cell, 0, 0, cell, cell);
+  return t;
+}
+
+// --- glitch effects -----------------------------------------------------------------
+// Each takes the clean tile (and the whole scene for crop effects) and returns a canvas.
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+
+function lum(r, g2, b) { return (0.299 * r + 0.587 * g2 + 0.114 * b) / 255; }
+
+function fxDither(src) {
+  const n = Math.max(12, Math.round(cell / 14));        // coarse pixels per side
+  const small = mk(n, n), s = small.getContext("2d");
+  s.drawImage(src, 0, 0, n, n);
+  const d = s.getImageData(0, 0, n, n), p = d.data, pal = pick(PAL_RGB), k = pal.length - 1;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const i = (y * n + x) * 4;
+    let v = lum(p[i], p[i + 1], p[i + 2]);
+    v = Math.min(1, Math.max(0, (v - 0.55) * 1.9 + 0.5));   // more contrast
+    const lvl = Math.min(k, Math.floor(v * k + BAYER[(y & 3) * 4 + (x & 3)]));
+    const c = pal[lvl]; p[i] = c[0]; p[i + 1] = c[1]; p[i + 2] = c[2];
+  }
+  s.putImageData(d, 0, 0);
+  const out = mk(cell, cell), o = out.getContext("2d");
+  o.imageSmoothingEnabled = false; o.drawImage(small, 0, 0, cell, cell);
+  return out;
+}
+
+function fxMosaic(src) {
+  const n = Math.max(6, Math.round(cell / range(18, 34)));
+  const small = mk(n, n), s = small.getContext("2d");
+  s.drawImage(src, 0, 0, n, n);
+  const out = mk(cell, cell), o = out.getContext("2d");
+  o.imageSmoothingEnabled = false; o.drawImage(small, 0, 0, cell, cell);
+  return out;
+}
+
+function fxAscii(src) {
+  const out = mk(cell, cell), o = out.getContext("2d");
+  o.drawImage(src, 0, 0);
+  o.fillStyle = "rgba(243,233,210,0.55)"; o.fillRect(0, 0, cell, cell);
+  const cs = Math.max(6, Math.round(cell / 13));
+  const nx = Math.floor(cell / (cs * 0.62)), ny = Math.floor(cell / cs);
+  const sm = mk(nx, ny), s = sm.getContext("2d"); s.drawImage(src, 0, 0, nx, ny);
+  const p = s.getImageData(0, 0, nx, ny).data;
+  o.font = `bold ${cs}px ui-monospace, Menlo, monospace`; o.textBaseline = "top";
+  const ink = pick([INK, "#E8341C", INK, "#2E7D62"]);
+  for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+    const i = (y * nx + x) * 4, v = lum(p[i], p[i + 1], p[i + 2]);
+    if (v > 0.86 && rnd() > 0.04) continue;                 // keep paper mostly clean
+    if (rnd() < 0.18) continue;
+    o.fillStyle = v < 0.45 ? PAPER : ink;
+    if (v < 0.45) { o.fillStyle = `rgb(${p[i]},${p[i + 1]},${p[i + 2]})`; o.fillRect(x * cs * 0.62, y * cs, cs * 0.62, cs); o.fillStyle = v < 0.3 ? "#6FE3C4" : PAPER; }
+    o.fillText(GLYPHS[Math.floor(rnd() * GLYPHS.length)], x * cs * 0.62, y * cs);
+  }
+  return out;
+}
+
+function fxHalftone(src) {
+  const out = mk(cell, cell), o = out.getContext("2d");
+  o.fillStyle = PAPER; o.fillRect(0, 0, cell, cell);
+  const step = Math.max(5, cell / 22), n = Math.ceil(cell / step);
+  const sm = mk(n, n), s = sm.getContext("2d"); s.drawImage(src, 0, 0, n, n);
+  const p = s.getImageData(0, 0, n, n).data;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const i = (y * n + x) * 4, v = lum(p[i], p[i + 1], p[i + 2]);
+    const r = step * 0.8 * Math.sqrt(1 - v);
+    if (r < 0.6) continue;
+    const sat = c => Math.max(0, Math.min(255, (c - 128) * 1.5 + 118));
+    o.fillStyle = `rgb(${sat(p[i])},${sat(p[i + 1])},${sat(p[i + 2])})`;
+    o.beginPath(); o.arc((x + 0.5) * step, (y + 0.5) * step, r, 0, 6.2832); o.fill();
+  }
+  return out;
+}
+
+function fxMisregister(src) {
+  const out = mk(cell, cell), o = out.getContext("2d");
+  const a = src.getContext("2d").getImageData(0, 0, cell, cell), p = a.data;
+  const d = o.createImageData(cell, cell), q = d.data;
+  // one plate slips: the warm (red) plate shifts, the rest stay put, like a misfed print
+  const dx = Math.round(cell * range(0.03, 0.06)) * (rnd() < 0.5 ? 1 : -1), dy = Math.round(cell * range(-0.025, 0.025));
+  for (let y = 0; y < cell; y++) for (let x = 0; x < cell; x++) {
+    const i = (y * cell + x) * 4;
+    const xr = Math.min(cell - 1, Math.max(0, x + dx)), yr = Math.min(cell - 1, Math.max(0, y + dy));
+    q[i] = p[(yr * cell + xr) * 4]; q[i + 1] = p[i + 1]; q[i + 2] = p[i + 2]; q[i + 3] = 255;
+  }
+  o.putImageData(d, 0, 0);
+  return out;
+}
+
+function fxFlip(src) {
+  const out = mk(cell, cell), o = out.getContext("2d");
+  const a = src.getContext("2d").getImageData(0, 0, cell, cell), p = a.data;
+  // two inks on the paper: dark parts print in one ink, mid tones in another
+  const inks = pick([["#1A1A1A", "#EE8FB4"], ["#3E62C4", "#F6C21B"], ["#2E7D62", "#E8341C"], ["#1A1A1A", "#6FE3C4"]]).map(hex);
+  const paper = hex(PAPER);
+  for (let i = 0; i < p.length; i += 4) {
+    const v = lum(p[i], p[i + 1], p[i + 2]);
+    const c = v < 0.38 ? inks[0] : v < 0.72 ? inks[1] : paper;
+    p[i] = c[0]; p[i + 1] = c[1]; p[i + 2] = c[2];
+  }
+  o.putImageData(a, 0, 0);
+  return out;
+}
+
+function fxCrop(src, scene, home) {        // shows a slightly wrong part of the picture
+  const out = mk(cell, cell), o = out.getContext("2d");
+  const hc = home % cols, hr = Math.floor(home / cols);
+  const sx = Math.max(0, Math.min(scene.full.width - cell, hc * cell + range(-0.45, 0.45) * cell));
+  const sy = Math.max(0, Math.min(scene.full.height - cell, hr * cell + range(-0.45, 0.45) * cell));
+  o.drawImage(scene.full, sx, sy, cell, cell, 0, 0, cell, cell);
+  return out;
+}
+
+const WASHES = ["#EE8FB4", "#B9A6E8", "#F6C21B", "#6FE3C4", "#F07F5E", "#7A8FE0"];
+function fxWash(src) {        // a flat ink colour printed over the block, keylines still showing
+  const out = mk(cell, cell), o = out.getContext("2d");
+  o.drawImage(src, 0, 0);
+  o.globalCompositeOperation = "multiply"; o.fillStyle = pick(WASHES); o.fillRect(0, 0, cell, cell);
+  o.globalCompositeOperation = "screen"; o.fillStyle = "rgba(243,233,210,0.18)"; o.fillRect(0, 0, cell, cell);
+  return out;
+}
+
+function fxSpecks(src) {      // 8-bit specks and stair-steps on the paper, like a printer fault
+  const out = mk(cell, cell), o = out.getContext("2d");
+  o.drawImage(src, 0, 0);
+  const px = Math.max(3, Math.round(cell / 26)), n = Math.floor(cell / px);
+  const sm = mk(n, n), s = sm.getContext("2d"); s.drawImage(src, 0, 0, n, n);
+  const p = s.getImageData(0, 0, n, n).data;
+  const ink = pick(["#E8341C", "#E8341C", "#EE8FB4", "#1A1A1A"]);
+  o.fillStyle = ink;
+  const blobs = 2 + Math.floor(rnd() * 5);
+  for (let b = 0; b < blobs; b++) {
+    let x = Math.floor(rnd() * n), y = Math.floor(rnd() * n);
+    for (let k = 0, len = 3 + Math.floor(rnd() * 14); k < len; k++) {
+      const i = (y * n + x) * 4;
+      if (lum(p[i], p[i + 1], p[i + 2]) > 0.7) o.fillRect(x * px, y * px, px, px);
+      if (rnd() < 0.5) x += rnd() < 0.5 ? 1 : -1; else y += rnd() < 0.5 ? 1 : -1;
+      x = Math.max(0, Math.min(n - 1, x)); y = Math.max(0, Math.min(n - 1, y));
+    }
+  }
+  return out;
+}
+
+function fxGuest(src, sc) {   // a block from one of the other scenes wanders in
+  const others = cuts.filter(c => c !== sc);
+  if (!others.length) return fxCrop(src, sc, Math.floor(rnd() * cols * rows));
+  const guest = tileOf(pick(others), Math.floor(rnd() * cols * rows));
+  return rnd() < 0.5 ? guest : pick([fxDither, fxMisregister, fxHalftone])(guest, sc, 0);
+}
+
+const EFFECTS = [
+  [fxDither, 5], [fxAscii, 4], [fxMosaic, 2], [fxHalftone, 2],
+  [fxMisregister, 3], [fxFlip, 2], [fxCrop, 3], [fxGuest, 4],
+  [fxWash, 4], [fxSpecks, 3],
+];
+// On bare paper most effects show nothing and read as a fault, so those tiles only get
+// the effects that print something of their own.
+const PAPER_EFFECTS = [[fxSpecks, 5], [fxAscii, 2], [fxGuest, 3], [fxWash, 1]];
+function pickEffect(list) {
+  const total = list.reduce((s, e) => s + e[1], 0);
+  let r = rnd() * total; for (const [f, w] of list) { if ((r -= w) < 0) return f; } return list[0][0];
+}
+
+// A glitched tile: the effect over the whole tile, or over a band of it.
+function glitched(scene, home) {
+  const bare = scene.busy[home] < 0.12;
+  const src = tileOf(scene, home), fx = pickEffect(bare ? PAPER_EFFECTS : EFFECTS), full = fx(src, scene, home);
+  if (bare || rnd() < 0.55) return full;
+  const out = mk(cell, cell), o = out.getContext("2d");
+  o.drawImage(src, 0, 0);
+  const horiz = rnd() < 0.6, a = range(0, 0.6), b = Math.min(1, a + range(0.25, 0.6));
+  o.save(); o.beginPath();
+  if (horiz) o.rect(0, Math.round(a * cell), cell, Math.round((b - a) * cell));
+  else o.rect(Math.round(a * cell), 0, Math.round((b - a) * cell), cell);
+  o.clip(); o.drawImage(full, 0, 0); o.restore();
+  return out;
+}
+
+// --- puzzle state -------------------------------------------------------------------
+// board[cellIndex] = tile id or -1. A tile's id is its home cell.
+let scene = null, sceneIdx = 0, cuts = [];
+let board = [], tiles = [];          // tiles[id] = {pos, from, t0, moving, look, flickUntil}
+let holes = [];                      // {cell, wait, last}
+let history = [];                    // slides made while scattering: {id, from, to}
+let phase = "whole", phaseT = 0, clock = 0;
+let removed = [];                    // tile ids taken out to make the holes
+let wave = null;                     // scene-change wave: {t0, next}
+let flickT = 0;
+
+const neighbours = c => {
+  const x = c % cols, y = Math.floor(c / cols), out = [];
+  if (x > 0) out.push(c - 1); if (x < cols - 1) out.push(c + 1);
+  if (y > 0) out.push(c - cols); if (y < rows - 1) out.push(c + cols);
+  return out;
+};
+
+function layout() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.round(innerWidth * DPR); H = Math.round(innerHeight * DPR);
+  cv.width = W; cv.height = H;
+  rows = innerWidth < 600 ? 6 : T.rows;
+  cell = Math.ceil(H / rows);
+  cols = Math.ceil(W / cell);
+  ox = Math.floor((W - cols * cell) / 2); oy = Math.floor((H - rows * cell) / 2);
+  
+  cuts = images.length ? images.map(cutScene) : [cutScene(null)];
+  startScene(sceneIdx, true);
+}
+
+function startScene(i, fresh) {
+  sceneIdx = i;
+  scene = cuts[i % cuts.length];
+  const n = cols * rows;
+  board = []; tiles = [];
+  for (let c = 0; c < n; c++) { board.push(c); tiles.push({ pos: c, from: c, t0: 0, moving: false, look: null, flickUntil: 0, alpha: 1 }); }
+  // pick which tiles step out to make the holes: spread out
+  const k = Math.max(3, Math.round(n * T.holeShare));
+  removed = []; holes = [];
+  while (removed.length < k) {
+    const c = Math.floor(rnd() * n);
+    if (removed.includes(c)) continue;
+    if (removed.some(r => Math.abs(r % cols - c % cols) + Math.abs(Math.floor(r / cols) - Math.floor(c / cols)) < 3)) continue;
+    removed.push(c);
+  }
+  history = []; lookQueue = [];
+  // the glitches print in one by one over the first second instead of all in one frame
+  for (let id = 0; id < n; id++) if (rnd() < T.glitchShare) lookQueue.push([id, true]);
+  phase = "open"; phaseT = 0;
+}
+
+function openHoles() {        // the chosen tiles lift out
+  for (const id of removed) { board[id] = -1; holes.push({ cell: id, last: -1 }); }
+  beats = 0; beatWait = T.beat * 0.4;
+}
+
+function closeHoles() {       // they drop back in at home
+  holes = [];
+  for (const id of removed) { board[id] = id; tiles[id].pos = id; }
+}
+
+function beginSlide(id, from, to, delay) {
+  const t = tiles[id];
+  board[from] = -1; board[to] = id;
+  t.from = from; t.pos = to; t.t0 = clock + (delay || 0); t.moving = true;
+}
+
+// Slides run in waves on a fixed beat: in each wave every gap pulls in one neighbour, the
+// moves a fraction of a second apart. Because the beat is fixed, the time until the picture
+// is whole again is known exactly and the countdown never guesses.
+// history holds one entry per wave: the moves made, in order.
+let beats = 0, beatWait = 0, lastWaveAt = 0, undoWait = 0;
+const tailOf = k => Math.max(0, k - 1) * T.stagger + T.slide;   // a wave of k moves, start to last landing
+
+function stepScatter(dt) {
+  beatWait -= dt;
+  if (beatWait > 0 || beats >= T.scatterWaves) return;
+  beatWait += T.beat; beats++; lastWaveAt = clock;
+  const wave = [];
+  for (const h of holes.slice().sort(() => rnd() - 0.5)) {
+    const opts = neighbours(h.cell).filter(c => board[c] >= 0 && !tiles[board[c]].moving && c !== h.last);
+    if (!opts.length) continue;
+    const from = pick(opts), id = board[from];
+    beginSlide(id, from, h.cell, wave.length * T.stagger);
+    wave.push({ id, from, to: h.cell });
+    h.last = h.cell; h.cell = from;
+  }
+  history.push(wave);
+}
+
+function stepGather(dt) {
+  // Replay the scatter backwards, a whole wave at a time. The moves inside one wave never
+  // touch the same cells, so they can run together again on the way back.
+  undoWait -= dt;
+  if (undoWait > 0 || !history.length) return;
+  const wave = history.pop();
+  wave.slice().reverse().forEach((m, k) => {
+    beginSlide(m.id, m.to, m.from, k * T.stagger);
+    const h = holes.find(h => h.cell === m.from); if (h) h.cell = m.to;
+  });
+  undoWait += T.gatherBeat;
+}
+
+// Seconds until the picture is whole, worked out from the schedule above.
+function untilWhole() {
+  const b = T.beat, gb = T.gatherBeat, N = T.scatterWaves, k = removed.length;
+  const firstTail = history.length ? tailOf(history[0].length) : tailOf(k);   // the last wave undone
+  const gatherFrom = (start, waves) => start + 0.6 + (waves - 1) * gb + firstTail;
+  if (phase === "open") return gatherFrom((1.2 - phaseT) + 0.4 * b + (N - 1) * b + tailOf(k), N);
+  if (phase === "scatter") {
+    const left = N - beats;
+    const start = left > 0 ? beatWait + (left - 1) * b + tailOf(k) : tailOf(k) - (clock - lastWaveAt);
+    return gatherFrom(Math.max(0, start), history.length + left);
+  }
+  if (phase === "gather") {
+    if (history.length) return Math.max(0, undoWait) + (history.length - 1) * gb + firstTail;
+    return tiles.reduce((m, t) => t.moving ? Math.max(m, t.t0 + T.slide - clock) : m, 0);
+  }
+  return 0;
+}
+
+// New glitch looks are made one per frame, so blocks landing together never stall a frame.
+let lookQueue = [];
+function land(id) {
+  const t = tiles[id]; t.moving = false;
+  if (rnd() < T.reroll) {
+    if (rnd() < T.glitchShare * 1.4) lookQueue.push([id, true]); else t.look = null;
+  }
+}
+
+function update(dt) {
+  clock += dt; phaseT += dt;
+  for (let id = 0; id < tiles.length; id++) {
+    const t = tiles[id];
+    if (t.moving && clock - t.t0 >= T.slide) land(id);
+  }
+  if (lookQueue.length) {
+    const [id, on] = lookQueue.shift();
+    if (!tiles[id].moving) tiles[id].look = on ? glitched(scene, id) : null;
+  }
+  // little flickers: a tile shows a glitch for a moment
+  flickT -= dt;
+  if (flickT <= 0 && !lookQueue.length) {
+    flickT = T.flickerEvery * range(0.4, 1.6);
+    const id = Math.floor(rnd() * tiles.length);
+    if (board[tiles[id].pos] === id) { tiles[id].flick = glitched(scene, id); tiles[id].flickUntil = clock + range(0.12, 0.5); }
+  }
+
+  if (phase === "open") {
+    if (phaseT > 1.2) { openHoles(); phase = "scatter"; phaseT = 0; }
+  } else if (phase === "scatter") {
+    stepScatter(dt);
+    if (beats >= T.scatterWaves && clock - lastWaveAt >= tailOf(removed.length) && !tiles.some(t => t.moving)) {
+      phase = "gather"; phaseT = 0; undoWait = 0.6;
+    }
+  } else if (phase === "gather") {
+    stepGather(dt);
+    if (!history.length && !tiles.some(t => t.moving)) { closeHoles(); phase = "whole"; phaseT = 0; }
+  } else if (phase === "whole") {
+    if (phaseT > T.holdWhole) { phase = "wave"; phaseT = 0; wave = { next: cuts[(sceneIdx + 1) % cuts.length] }; }
+  } else if (phase === "wave") {
+    if (phaseT > 3.2) {
+      const next = (sceneIdx + 1) % cuts.length;
+      wave = null; startScene(next, false);
+    }
+  }
+}
+
+// --- drawing ------------------------------------------------------------------------
+function cellXY(c) { return [ox + (c % cols) * cell, oy + Math.floor(c / cols) * cell]; }
+
+let waveBudget = 0;
+function draw() {
+  waveBudget = 2;
+  g.fillStyle = PAPER; g.fillRect(0, 0, W, H);
+  const n = cols * rows;
+
+  // empty cells: a recess in the tray
+  for (let c = 0; c < n; c++) {
+    const arriving = board[c] >= 0 && tiles[board[c]].moving;   // still in transit: its cell is open
+    if (board[c] !== -1 && !arriving) continue;
+    const [x, y] = cellXY(c);
+    g.fillStyle = RECESS; g.fillRect(x, y, cell, cell);
+    const sh = g.createLinearGradient(x, y, x, y + cell * 0.18);
+    sh.addColorStop(0, "rgba(26,26,26,0.22)"); sh.addColorStop(1, "rgba(26,26,26,0)");
+    g.fillStyle = sh; g.fillRect(x, y, cell, cell * 0.18);
+  }
+
+  // tiles: still ones first, moving ones on top
+  const still = [], moving = [];
+  for (let id = 0; id < tiles.length; id++) {
+    const t = tiles[id];
+    if (board[t.pos] !== id) continue;
+    (t.moving ? moving : still).push(id);
+  }
+  for (const id of still) drawTile(id);
+  for (const id of moving) drawTile(id);
+
+  // no drawn grid: the blocks butt together and only the gaps show where the cells are
+  drawTimer();
+}
+
+function drawTile(id) {
+  const t = tiles[id];
+  let [x, y] = cellXY(t.pos);
+  let speed = 0;
+  if (t.moving) {
+    // a soft glide: eases out of the cell, travels, and settles gently into the gap
+    const u = Math.max(0, Math.min(1, (clock - t.t0) / T.slide));
+    const k = u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+    speed = u < 0.5 ? 12 * u * u : 12 * Math.pow(1 - u, 2);           // 0..3, peaks mid-way
+    const [fx, fy] = cellXY(t.from);
+    x = fx + (x - fx) * k; y = fy + (y - fy) * k;
+  }
+  let img = t.look, src = scene;      // img: a glitched canvas, or null to draw from the scene
+  if (t.flickUntil > clock) img = t.flick;
+
+  // during a scene change a diagonal wave reprints each tile with the next scene
+  if (phase === "wave" && wave) {
+    const c = t.pos % cols, r = Math.floor(t.pos / cols);
+    const at = 0.25 + (c + r) / (cols + rows) * 2.4 + Math.sin(id * 12.9898) * 0.15;
+    const dtw = phaseT - at;
+    if (dtw > 0.35) { img = null; src = wave.next; }
+    else if (dtw > -0.15) {
+      if (!t.waveLook && waveBudget > 0) { waveBudget--; t.waveLook = glitched(rnd() < 0.5 ? scene : wave.next, id); }
+      if (t.waveLook) img = t.waveLook;
+    }
+  }
+
+  const face = img || src.full;
+  const sx0 = img ? 0 : (id % cols) * cell, sy0 = img ? 0 : Math.floor(id / cols) * cell;
+  const X = Math.round(x), Y = Math.round(y);
+  if (t.moving) {              // lifted while it travels: a soft shadow that grows mid-way
+    const lift = Math.min(1, speed / 3);
+    g.save();
+    g.shadowColor = `rgba(26,26,26,${0.12 + 0.2 * lift})`;
+    g.shadowBlur = cell * (0.04 + 0.1 * lift);
+    g.shadowOffsetY = cell * (0.01 + 0.03 * lift);
+    g.fillStyle = PAPER; g.fillRect(X, Y, cell, cell);
+    g.restore();
+  }
+  g.drawImage(face, sx0, sy0, cell, cell, X, Y, cell, cell);
+}
+
+// --- the countdown ------------------------------------------------------------------
+// A small printed label at the bottom: pixel digits counting down to the moment the
+// picture is whole, and a row of pixel squares showing how much of it is in place.
+const DIGITS = {
+  "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+  "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+  "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+  "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+  "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+  "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+  "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+  "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+  "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+  "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+  ":": ["0", "1", "1", "0", "1", "1", "0"],
+};
+
+function drawTimer() {
+  const secs = Math.ceil(untilWhole());
+  const txt = `${String(Math.floor(secs / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}`;
+  const n = cols * rows;
+  const placed = tiles.reduce((a, t, id) => a + (t.pos === id && board[id] === id ? 1 : 0), 0) / n;
+
+  const px = Math.max(2, Math.round(cell * 0.03));               // one font pixel
+  let tw = 0; for (const ch of txt) tw += (DIGITS[ch][0].length + 1) * px; tw -= px;
+  const squares = 20, sq = px * 2, gap = Math.max(1, Math.round(px * 0.5));
+  const barW = squares * sq + (squares - 1) * gap;
+  // the label is part of the grid: two cells wide, standing on the bottom grid line
+  const pad = px * 3, boxW = cell * 2, boxH = Math.round(7 * px + pad * 3 + sq);
+  const lw = Math.max(1.5, Math.round(cell * T.line * 2) / 2);
+  const bx = ox + (Math.floor(cols / 2) - 1) * cell, by = oy + rows * cell - boxH;
+
+  g.fillStyle = INK; g.fillRect(bx - lw / 2, by - lw / 2, boxW + lw, boxH + lw);
+  g.fillStyle = PAPER; g.fillRect(bx + lw / 2, by + lw / 2, boxW - lw, boxH - lw);
+
+  // digits; the colon blinks while the picture is still coming apart or back
+  const done = secs <= 0;
+  const blink = !done && (clock % 1) > 0.5;
+  let cx = bx + (boxW - tw) / 2;
+  for (const ch of txt) {
+    const rowsG = DIGITS[ch];
+    g.fillStyle = done ? "#E8341C" : INK;
+    if (!(ch === ":" && blink)) {
+      for (let r = 0; r < 7; r++) for (let c = 0; c < rowsG[r].length; c++)
+        if (rowsG[r][c] === "1") g.fillRect(cx + c * px, by + pad + r * px, px, px);
+    }
+    cx += (rowsG[0].length + 1) * px;
+  }
+
+  // wholeness: filled squares for the share of blocks back home
+  const fill = Math.round(placed * squares), sx = bx + (boxW - barW) / 2, sy = by + pad * 2 + 7 * px;
+  for (let i = 0; i < squares; i++) {
+    g.fillStyle = i < fill ? "#E8341C" : "#DCCFB2";
+    g.fillRect(sx + i * (sq + gap), sy, sq, sq);
+  }
+}
+
+// --- loop ---------------------------------------------------------------------------
+let last = 0;
+function frame(now) {
+  if (!last) last = now;
+  const dt = Math.min(0.1, (now - last) / 1000) * SPEED; last = now;
+  update(dt); draw();
+  if (DEBUG) hud.textContent = `${phase} · scene ${sceneIdx + 1}/${Math.max(1, images.length)} · history ${history.length} · ${cols}×${rows}`;
+}
+
+window.shiftingGardenStep = () => frame(performance.now());
+loadScenes(() => {
+  sceneIdx = Math.floor(rnd() * Math.max(1, images.length));
+  layout();
+  addEventListener("resize", () => { clearTimeout(window._rz); window._rz = setTimeout(layout, 200); });
+  if (!SAVER) { const loop = t => { frame(t); requestAnimationFrame(loop); }; requestAnimationFrame(loop); }
+  if (!SAVER) addEventListener("keydown", e => {
+    if (e.key === "n") { phase = "whole"; phaseT = T.holdWhole; }
+    if (e.key === "d") { hud.style.display = hud.style.display === "block" ? "none" : "block"; }
+  });
+});
+</script>
+</body>
+</html>
